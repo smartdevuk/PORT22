@@ -54,9 +54,9 @@ class ProfileDialog(QDialog):
         form.setVerticalSpacing(12)
         self.fields = {}
         for k, title, hint in (
-            ("name", "Name", "e.g. RawHoney production"),
-            ("host", "Host", "Droplet IP address or hostname"),
-            ("user", "Username", "e.g. paul or root"),
+            ("name", "Name", "e.g. Production server"),
+            ("host", "Host", "IP address or hostname"),
+            ("user", "Username", "e.g. root"),
         ):
             field = QLineEdit(self.profile.get(k, ""))
             field.setPlaceholderText(hint)

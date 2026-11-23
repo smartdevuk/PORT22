@@ -2,7 +2,7 @@
 
 A native SFTP client for Chromebook and Linux. Save your servers and SSH keys, browse local and remote folders side by side, and watch parallel transfers on a live throughput graph.
 
-**[Download PORT22 for Debian / Chromebook](https://github.com/smartdevuk/PORT22/raw/refs/heads/main/packages/port22_1.1.0_all.deb)** · [Installation](#install-on-a-chromebook) · [Full-resolution transfer video](https://github.com/smartdevuk/PORT22/raw/refs/heads/main/docs/media/transfer.mp4)
+**[Download PORT22 for Debian / Chromebook](https://github.com/smartdevuk/PORT22/raw/refs/heads/main/packages/port22_1.1.1_all.deb)** · [Installation](#install-on-a-chromebook) · [Full-resolution transfer video](https://github.com/smartdevuk/PORT22/raw/refs/heads/main/docs/media/transfer.mp4)
 
 ![PORT22 transferring a release folder over SFTP. The live throughput trace and four file progress bars update during the download.](docs/media/transfer.gif)
 
@@ -16,12 +16,12 @@ The nine-second recording shows an actual SFTP download from a local OpenSSH ser
 
    ```sh
    sudo apt update
-   sudo apt install ~/port22_1.1.0_all.deb
+   sudo apt install ~/port22_1.1.1_all.deb
    ```
 
 4. Search the Launcher for **PORT22**. Right-click the icon and choose **Pin to shelf**. Opening it takes you straight to your saved connections.
 
-The same package targets Debian 12 and 13 on desktop Linux. If you downloaded it to your usual Downloads folder, run `sudo apt install ~/Downloads/port22_1.1.0_all.deb`. The package is architecture-independent and uses Debian's native Qt, Python and SSH libraries.
+The same package targets Debian 12 and 13 on desktop Linux. If you downloaded it to your usual Downloads folder, run `sudo apt install ~/Downloads/port22_1.1.1_all.deb`. The package is architecture-independent and uses Debian's native Qt, Python and SSH libraries.
 
 **Upgrading from Violet Relay 1.0:** close the old app, then install PORT22. APT replaces the earlier package. PORT22 reopens its saved connections, known host keys, preferences and queue. Pin the new PORT22 launcher.
 
@@ -61,13 +61,14 @@ PORT22 publishes a replacement after writing a temporary file and checking its l
 ```sh
 sudo apt install python3-pyqt5 python3-paramiko python3-cryptography putty-tools dpkg-dev
 ./build.sh
-sudo apt install ./dist/port22_1.1.0_all.deb
+sudo apt install ./dist/port22_1.1.1_all.deb
 ```
 
 For development, run `/usr/bin/python3 port22/app.py` from the checkout. The tests below use throwaway keys, temporary directories and a loopback OpenSSH server. The transfer and GUI tests require `openssh-server`, `openssh-client`, and a local account allowed to authenticate by public key.
 
 ```sh
 /usr/bin/python3 tests/telemetry_test.py
+QT_QPA_PLATFORM=offscreen /usr/bin/python3 tests/profile_menu_test.py
 VIOLET_TEST_FILES=2000 /usr/bin/python3 tests/integration.py
 /usr/bin/python3 tests/recovery.py
 QT_QPA_PLATFORM=offscreen /usr/bin/python3 tests/gui_smoke.py

@@ -34,7 +34,7 @@ from connection import Session, describe, load_key
 from store import Store, data_dir
 from transfer import Batch, Endpoint
 from telemetry import Throughput, Monitor, FileLanes
-from visual import BG, LILAC, MINT, STYLES, SignalArt, button, frame, icon, label
+from visual import BG, LILAC, STYLES, SignalArt, button, frame, icon, label
 from widgets import Pane, ProfileDialog, download_dir
 
 
@@ -317,7 +317,7 @@ class Window(QMainWindow):
         self.lead.setText(
             "Choose a server to open its file workspace."
             if profiles
-            else "Add your first server and select its SSH key."
+            else "Add your first server to get started."
         )
         self.saved_sub.setText(
             count_text(len(profiles), "SAVED SERVER", "SAVED SERVERS").upper()
@@ -356,27 +356,14 @@ class Window(QMainWindow):
             menu.setToolTip("Connection options")
             menu.setAccessibleName("Connection options")
             m = QMenu(menu)
-            m.addAction("Edit connection", lambda _, p=p: self.edit(p))
-            m.addAction("Remove connection", lambda _, p=p: self.remove(p))
+            m.addAction("Edit connection").triggered.connect(
+                lambda checked=False, profile=p: self.edit(profile)
+            )
+            m.addAction("Remove connection").triggered.connect(
+                lambda checked=False, profile=p: self.remove(profile)
+            )
             menu.setMenu(m)
             row.addWidget(menu)
-            self.cards.addWidget(w)
-        if not profiles:
-            w = frame()
-            l = QHBoxLayout(w)
-            l.setContentsMargins(17, 14, 17, 14)
-            g = label()
-            g.setPixmap(icon("key", MINT, 28).pixmap(28, 28))
-            l.addWidget(g)
-            text = QVBoxLayout()
-            text.addWidget(label("Using your FileZilla key?", "strong"))
-            sub = label(
-                "Select your existing private key when you add a connection. OpenSSH, PEM and PuTTY keys are supported.",
-                "muted",
-            )
-            sub.setWordWrap(True)
-            text.addWidget(sub)
-            l.addLayout(text, 1)
             self.cards.addWidget(w)
         self.saved_foot.setText(
             "Connecting…"
