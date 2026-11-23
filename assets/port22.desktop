@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=PORT22
+GenericName=SFTP File Transfer
+Comment=Browse SSH servers and transfer files in parallel
+Exec=port22
+Icon=port22
+Terminal=false
+StartupNotify=true
+StartupWMClass=port22
+Categories=Network;FileTransfer;
+Keywords=SFTP;SSH;DigitalOcean;upload;download;
