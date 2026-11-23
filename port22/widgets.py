@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLineEdit,
+    QMenu,
     QSpinBox,
     QTableView,
     QVBoxLayout,
@@ -217,6 +218,7 @@ class Pane(QWidget):
     goto = pyqtSignal(str)
     send = pyqtSignal()
     selection = pyqtSignal()
+    permissions = pyqtSignal()
 
     def __init__(self, local):
         super().__init__()
@@ -296,6 +298,8 @@ class Pane(QWidget):
             lambda *args: self.selection.emit()
         )
         self.table.doubleClicked.connect(self.open)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.context_menu)
         layout.addWidget(self.table, 1)
         self.note = label("", "micro")
         layout.addWidget(self.note)
@@ -303,6 +307,29 @@ class Pane(QWidget):
     def resizeEvent(self, event):
         self.table.setColumnHidden(2, self.width() < 390)
         super().resizeEvent(event)
+
+    def context_menu(self, point):
+        index = self.table.indexAt(point)
+        if not index.isValid() or self.busy:
+            return
+        if not self.table.selectionModel().isRowSelected(index.row(), QModelIndex()):
+            self.table.selectRow(index.row())
+        entries = self.chosen()
+        menu = QMenu(self)
+        if len(entries) == 1 and entries[0][1] == "folder":
+            open_folder = menu.addAction("Open folder")
+            open_folder.triggered.connect(
+                lambda: self.goto.emit(posixpath.join(self.path, entries[0][0]))
+            )
+        send = menu.addAction("Upload" if self.local else "Download")
+        send.setEnabled(self.transfer.isEnabled())
+        send.triggered.connect(lambda checked=False: self.send.emit())
+        menu.addSeparator()
+        permissions = menu.addAction("Permissions…")
+        permissions.setEnabled(all(r[1] in ("file", "folder") for r in entries))
+        permissions.triggered.connect(lambda checked=False: self.permissions.emit())
+        menu.exec_(self.table.viewport().mapToGlobal(point))
+        menu.deleteLater()
 
     def open(self, index):
         name, typ, *_ = self.model.rows[index.row()]

@@ -6,7 +6,7 @@ import time
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer
 from PyQt5.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen
-from PyQt5.QtWidgets import QWidget
+from PyQt5.QtWidgets import QScrollBar, QWidget
 
 from widgets import fmt
 
@@ -284,11 +284,19 @@ class Monitor(QWidget):
 
 
 class FileLanes(QWidget):
-    """Show one measured file offset per channel, with an interpolated cursor."""
+    """A fixed four-row viewport over recent file starts, oldest to newest."""
 
     def __init__(self):
         super().__init__()
         self.tracks = {}
+        self.keys = []
+        self.states = {}
+        self.setFixedHeight(30 + 27 * 4)
+        self.scroll = QScrollBar(Qt.Vertical, self)
+        self.scroll.setAccessibleName("File activity history")
+        self.scroll.setPageStep(4)
+        self.scroll.valueChanged.connect(self.update)
+        self.scroll.hide()
         self.sample_time = 0
         self.motion = True
         self.timer = QTimer(self)
@@ -297,15 +305,24 @@ class FileLanes(QWidget):
 
     def set_files(self, active, now, motion):
         tracks = {}
-        for key, (name, offset, size) in active.items():
-            target = min(1, offset / size) if size else 0
+        for key, (name, offset, size, state) in active.items():
+            target = 1 if state == "done" else min(1, offset / size) if size else 0
             start = self.fraction(key, now) if key in self.tracks and motion else target
             tracks[key] = (name, start, target, size)
+        follow = self.scroll.value() == self.scroll.maximum()
+        anchor = self.keys[self.scroll.value()] if self.keys else None
+        self.keys = list(tracks)
+        self.states = {key: row[3] for key, row in active.items()}
+        self.scroll.setRange(0, max(0, len(tracks) - 4))
+        self.scroll.setVisible(len(tracks) > 4)
+        if follow:
+            self.scroll.setValue(self.scroll.maximum())
+        elif anchor in tracks:
+            self.scroll.setValue(self.keys.index(anchor))
         self.tracks = tracks
         self.sample_time = now
         self.motion = motion
-        self.setFixedHeight(30 + 27 * len(tracks))
-        self.setVisible(bool(tracks))
+        self.show()
         if (
             self.isVisible()
             and self.motion
@@ -316,9 +333,26 @@ class FileLanes(QWidget):
             self.timer.stop()
         self.setAccessibleName("Active files")
         self.setAccessibleDescription(
-            ", ".join(f"{name}, {target:.0%}" for name, _, target, _ in tracks.values())
+            ", ".join(
+                f"{name}, {target:.0%}"
+                for name, _, target, _ in list(tracks.values())[
+                    self.scroll.value() : self.scroll.value() + 4
+                ]
+            )
         )
         self.update()
+
+    def resizeEvent(self, event):
+        self.scroll.setGeometry(self.width() - 15, 28, 13, 106)
+        super().resizeEvent(event)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y() or event.pixelDelta().y()
+        if delta and self.scroll.maximum():
+            self.scroll.setValue(self.scroll.value() + (-1 if delta > 0 else 1))
+            event.accept()
+        else:
+            super().wheelEvent(event)
 
     def fraction(self, key, now):
         _, start, target, _ = self.tracks[key]
@@ -340,16 +374,21 @@ class FileLanes(QWidget):
         w = self.width()
         left = 12
         limit = max(125, min(w * 0.42, 345))
-        right = w - 64
+        right = w - 94
         p.setBrush(QColor("#18131f"))
         p.setPen(QPen(QColor("#40334e"), 1))
         p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, self.height() - 1), 8, 8)
-        number(p, QRectF(left, 2, w - 24, 24), "ACTIVE FILES", 10, "#beadcd", bold=True)
+        number(
+            p, QRectF(left, 2, w - 24, 24), "FILE ACTIVITY", 10, "#beadcd", bold=True
+        )
         now = time.monotonic()
-        for i, key in enumerate(sorted(self.tracks)):
+        if not self.keys:
+            number(p, QRectF(left, 28, w - 32, 22), "Waiting for files…", 11, "#ad9bbd")
+        start = self.scroll.value()
+        for i, key in enumerate(self.keys[start : start + 4]):
             name, _, target, _ = self.tracks[key]
             row = 28 + i * 27
-            number(p, QRectF(left, row, 22, 21), f"{i + 1:02d}", 10, "#ad8dd4")
+            number(p, QRectF(left, row, 22, 21), f"{start + i + 1:02d}", 10, "#ad8dd4")
             # Use the available label width; long paths retain their basename.
             font = QFont("DejaVu Sans Mono")
             font.setPixelSize(11)
@@ -377,8 +416,10 @@ class FileLanes(QWidget):
                 p.drawEllipse(QPointF(x, y), 2.8, 2.8)
             number(
                 p,
-                QRectF(right + 5, row, 45, 21),
-                f"{target:.0%}",
+                QRectF(right + 5, row, 64, 21),
+                f"{target:.0%}"
+                if self.states[key] == "working"
+                else self.states[key].capitalize(),
                 11,
                 "#d7c4e6",
                 align=Qt.AlignRight,

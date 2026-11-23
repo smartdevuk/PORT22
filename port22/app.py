@@ -1,7 +1,9 @@
 #!/usr/bin/python3
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import posixpath
+import stat
 import sys
 import threading
 import time
@@ -12,7 +14,6 @@ from PyQt5.QtGui import QKeySequence, QPalette, QColor
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -30,12 +31,14 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from conflicts import ConflictRules, POLICIES
+from dialogs import ConflictDialog, PermissionDialog, QueueDialog
 from connection import Session, describe, load_key
 from store import Store, data_dir
 from transfer import Batch, Endpoint
 from telemetry import Throughput, Monitor, FileLanes
 from visual import BG, LILAC, STYLES, SignalArt, button, frame, icon, label
-from widgets import Pane, ProfileDialog, download_dir
+from widgets import Pane, ProfileDialog, download_dir, fmt
 
 
 def page():
@@ -117,6 +120,7 @@ class Window(QMainWindow):
         self.profiles = store.objects("profiles")
         self.settings = store.objects("settings")
         self.session = None
+        self.conflicts = None
         self.connecting = False
         self.batch = None
         self.closing = False
@@ -211,6 +215,7 @@ class Window(QMainWindow):
             p.goto.connect(lambda path, p=p: self.browse(p, path))
             p.send.connect(lambda p=p: self.enqueue(p))
             p.selection.connect(self.selection)
+            p.permissions.connect(lambda p=p: self.permissions(p))
         self.local.table.dropped.connect(lambda _: self.enqueue(self.remote))
         self.remote.table.dropped.connect(lambda _: self.enqueue(self.local))
         wl.addWidget(spl, 1)
@@ -481,6 +486,7 @@ class Window(QMainWindow):
         def ok(result):
             self.connecting = False
             self.session, home = result
+            self.conflicts = ConflictRules(self.ask_conflict)
             self.status.setText("●  Connected")
             self.status.setObjectName("mint")
             self.draw_profiles()
@@ -615,62 +621,107 @@ class Window(QMainWindow):
             return
         dest = self.remote if p.local else self.local
         direction = "Upload" if p.local else "Download"
-        dlg = QDialog(self)
-        dlg.setWindowTitle(direction)
-        dlg.setMinimumWidth(410)
-        l = QVBoxLayout(dlg)
-        l.setContentsMargins(22, 20, 22, 20)
-        l.setSpacing(12)
-        l.addWidget(
-            label(
-                direction
-                + " "
-                + (
-                    entries[0][0]
-                    if len(entries) == 1
-                    else count_text(len(entries), "item")
-                ),
-                "h2",
-            )
-        )
-        route = label(
-            ("To " + self.session.profile["name"] if p.local else "To Chromebook")
-            + "  ·  "
-            + dest.path,
-            "muted",
-        )
-        route.setWordWrap(True)
-        l.addWidget(route)
-        form = QFormLayout()
-        policy = QComboBox()
-        policy.addItems(["Skip existing files", "Replace existing files"])
-        form.addRow("Name conflicts", policy)
-        l.addLayout(form)
-        if any(r[1] != "file" for r in entries):
-            info = label(
-                "Folder transfers include hidden files and empty folders. Symbolic links are skipped.",
-                "muted",
-            )
-            info.setWordWrap(True)
-            l.addWidget(info)
-        box = QDialogButtonBox(QDialogButtonBox.Cancel)
-        start = box.addButton(direction, QDialogButtonBox.AcceptRole)
-        start.setDefault(True)
-        box.accepted.connect(dlg.accept)
-        box.rejected.connect(dlg.reject)
-        l.addWidget(box)
-        if not dlg.exec_():
-            return
         self.store.add(
             self.session.profile["id"],
             direction,
             p.path,
             dest.path,
             entries,
-            ("skip", "replace")[policy.currentIndex()],
+            "ask",
         )
         self.work_note.setText(f"{direction} queued. Open Transfers to see progress.")
         self.tick()
+
+    def ask_conflict(self, batch, path, source, target):
+        def prompt():
+            if self.closing or self.session is not batch.session or batch.stop.is_set():
+                return None
+            dlg = ConflictDialog(self, batch.job["direction"], path, source, target)
+            guard = QTimer(dlg)
+            guard.timeout.connect(
+                lambda: dlg.reject() if batch.stop.is_set() or self.closing else None
+            )
+            guard.start(200)
+            choice = dlg.choice()
+            guard.stop()
+            dlg.deleteLater()
+            return choice
+
+        return self.bridge.request(prompt)
+
+    def permissions(self, pane):
+        entries = pane.chosen()
+        session, folder, sequence = self.session, pane.path, pane.seq
+        if not session or not entries or pane.busy:
+            return
+        paths = [(posixpath.join(folder, name), typ) for name, typ, _ in entries]
+
+        def inspect(path, typ, endpoint):
+            mode = endpoint.stat(path).st_mode
+            if not (
+                (typ == "folder" and stat.S_ISDIR(mode))
+                or (typ == "file" and stat.S_ISREG(mode))
+            ):
+                raise ValueError(f"Item changed type: {path}")
+            return mode
+
+        def channel():
+            return nullcontext(None) if pane.local else session.channel()
+
+        def read():
+            with channel() as ch:
+                endpoint = Endpoint(ch)
+                return [inspect(path, typ, endpoint) for path, typ in paths]
+
+        def edit(modes):
+            if self.session is not session or pane.seq != sequence:
+                return
+            title = (
+                entries[0][0]
+                if len(entries) == 1
+                else count_text(len(entries), "selected item")
+            )
+            dlg = PermissionDialog(self, title, modes)
+            if not dlg.exec_() or self.session is not session:
+                return
+            mode = int(dlg.mode.text(), 8)
+
+            def apply():
+                with channel() as ch:
+                    endpoint = Endpoint(ch)
+                    for i, (path, typ) in enumerate(paths):
+                        try:
+                            inspect(path, typ, endpoint)
+                            if ch:
+                                ch.chmod(path, mode)
+                            else:
+                                os.chmod(path, mode, follow_symlinks=False)
+                        except Exception as error:
+                            raise ValueError(
+                                f"Updated {i} of {len(paths)} items. {path}: {describe(error)}"
+                            ) from error
+
+            def complete(_):
+                if self.session is session and pane.seq == sequence:
+                    pane.note.setText(f"Permissions set to {mode:03o} · {title}")
+
+            self.background(apply, complete)
+
+        self.background(read, edit)
+
+    def progress_text(self, job, active):
+        counts = self.store.progress(job["id"], active)
+        text = (
+            f"{counts['copied']:,}/{counts['files']:,} files   ·   "
+            f"{fmt(counts['transferred'])} / {fmt(counts['size'])}"
+        )
+        if counts["discovering"]:
+            text += "   ·   Scanning…"
+        if counts["skipped"]:
+            text += f"   ·   {counts['skipped']:,} skipped"
+        if counts["failed"]:
+            text += f"   ·   {counts['failed']:,} failed"
+        return text
 
     def preferences(self):
         dlg = QDialog(self)
@@ -723,7 +774,7 @@ class Window(QMainWindow):
             self.batch = None
             _, total = finished.snapshot()
             self.series.sample(finished.finished_at, total, {}, finished=True)
-            self.lanes.set_files({}, finished.finished_at, False)
+            self.lanes.set_files(finished.activity(), finished.finished_at, False)
             outcome = finished.outcome or "Stopped"
             self.render_monitor(finished, outcome)
             if self.session and self.session is finished.session:
@@ -734,16 +785,8 @@ class Window(QMainWindow):
                 )
                 if pane.path and not pane.busy:
                     self.browse(pane, pane.path)
-                state = next(
-                    (
-                        j["status"]
-                        for j in self.store.jobs()
-                        if j["id"] == finished.job["id"]
-                    ),
-                    "",
-                )
                 self.work_note.setText(
-                    f"{finished.job['direction']} · {state}. See Transfers for details."
+                    outcome + "   ·   " + self.progress_text(finished.job, {})
                 )
         jobs = self.store.jobs()
         if self.session and not self.batch:
@@ -758,7 +801,11 @@ class Window(QMainWindow):
             )
             if nextjob:
                 self.batch = Batch(
-                    self.store, self.session, nextjob, self.settings.get("parallel", 4)
+                    self.store,
+                    self.session,
+                    nextjob,
+                    self.settings.get("parallel", 4),
+                    self.conflicts,
                 )
                 self.series.reset(time.monotonic())
                 self.batch.thread.start()
@@ -767,15 +814,11 @@ class Window(QMainWindow):
             active, total = self.batch.snapshot()
             self.series.sample(now, total, active)
             self.render_monitor(self.batch, "")
-            self.lanes.set_files(active, now, self.settings.get("motion", True))
+            self.lanes.set_files(
+                self.batch.activity(), now, self.settings.get("motion", True)
+            )
             if self.session is self.batch.session and self.stack.currentIndex() == 1:
-                if active:
-                    first = next(iter(active.values()))[0]
-                    self.work_note.setText(
-                        f"{self.batch.job['direction']}  ·  {posixpath.basename(first)}"
-                    )
-                else:
-                    self.work_note.setText("Processing queue…")
+                self.work_note.setText(self.progress_text(self.batch.job, active))
         n = sum(j["status"] not in ("Complete",) for j in jobs)
         self.nav[2].setText(
             ""
@@ -801,6 +844,7 @@ class Window(QMainWindow):
             db.execute("DELETE FROM jobs WHERE status='Complete'")
         if not self.store.jobs():
             self.queue_monitor.hide()
+            self.lanes.hide()
         self.draw_queue()
 
     def action(self, job):
@@ -850,7 +894,20 @@ class Window(QMainWindow):
         dlg.setTextFormat(Qt.PlainText)
         dlg.setText(j["title"])
         nm = self.profiles.get(j["profile"], {}).get("name", "Removed connection")
-        msg = f"{j['direction']} · {nm}\nFrom {j['src']}\nTo {j['dst']}\nExisting files: {j['policy']}"
+        rule = next(
+            (row["policy"] for row in self.store.jobs() if row["id"] == j["id"]),
+            j["policy"],
+        )
+        policy = POLICIES.get(rule, "Ask on conflict")
+        if (
+            rule == "ask"
+            and self.session
+            and self.session.profile["id"] == j["profile"]
+            and self.conflicts
+            and self.conflicts.session_rule
+        ):
+            policy = POLICIES[self.conflicts.session_rule] + " (this session)"
+        msg = f"{j['direction']} · {nm}\nFrom {j['src']}\nTo {j['dst']}\nExisting files: {policy}"
         dlg.setInformativeText(msg)
         if text:
             dlg.setDetailedText(text)
@@ -889,6 +946,13 @@ class Window(QMainWindow):
                     label(j["status"], "mint" if j["status"] == "Complete" else "micro")
                 )
                 row.addWidget(button("Details", lambda j=j: self.details(j)))
+                if j["status"] != "Complete":
+                    row.addWidget(
+                        button(
+                            "Queue",
+                            lambda j=j: QueueDialog(self, self.store, j).exec_(),
+                        )
+                    )
                 action = {
                     "Running": "Pause",
                     "Queued": "Pause",
@@ -907,42 +971,17 @@ class Window(QMainWindow):
                 status = label("", "muted")
                 status.setWordWrap(True)
                 col.addWidget(status)
-                current = label("", "micro")
-                current.setWordWrap(True)
-                col.addWidget(current)
-                self.queue_widgets[j["id"]] = (status, current)
+                self.queue_widgets[j["id"]] = status
                 self.queue_cards.addWidget(w)
                 self.update_summary(j)
         if self.batch and self.batch.job["id"] in self.queue_widgets:
             self.update_summary(self.batch.job)
 
     def update_summary(self, j):
-        summary, detail = self.queue_widgets[j["id"]]
-        states = self.store.states(j["id"])
-        files = sum(i["n"] for i in states if i["kind"] == "file")
-        done = sum(
-            i["n"] for i in states if i["kind"] == "file" and i["state"] == "done"
+        active = (
+            self.series.active if self.batch and self.batch.job["id"] == j["id"] else {}
         )
-        skipped = sum(i["n"] for i in states if i["state"] == "skipped")
-        failed = sum(i["n"] for i in states if i["state"] == "failed")
-        desc = f"{done:,} of {count_text(files, 'file')} copied"
-        if skipped:
-            desc += f"   ·   {skipped:,} skipped"
-        if failed:
-            desc += f"   ·   {failed:,} failed"
-        summary.setText(desc)
-        lines = []
-        if (
-            self.batch
-            and self.batch.job["id"] == j["id"]
-            and self.batch.thread.is_alive()
-        ):
-            if self.batch.stop.is_set():
-                lines = ["Pausing…"]
-            elif not self.series.active:
-                lines = ["Discovering or verifying files…"]
-        detail.setVisible(bool(lines))
-        detail.setText("\n".join(lines))
+        self.queue_widgets[j["id"]].setText(self.progress_text(j, active))
 
     def closeEvent(self, event):
         if self.connecting:

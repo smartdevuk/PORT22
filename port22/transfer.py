@@ -1,5 +1,6 @@
 """A bounded worker pool and an interruptible, disk-backed directory walk."""
 
+from collections import OrderedDict
 import concurrent.futures as futures
 import contextlib
 import ctypes
@@ -13,15 +14,7 @@ import time
 
 import paramiko
 from connection import describe
-
-
-class Paused(Exception):
-    pass
-
-
-def check(stop):
-    if stop.is_set():
-        raise Paused()
+from conflicts import Paused, check, should_replace
 
 
 def safe_name(name):
@@ -159,7 +152,7 @@ class Endpoint:
             install_exclusive(temp, dest)
 
 
-def copy_file(src, dst, source, destination, item, job, stop, progress):
+def copy_file(src, dst, source, destination, item, job, stop, progress, decide):
     before = src.stat(source)
     if not stat.S_ISREG(before.st_mode):
         raise ValueError("Source changed type while queued.")
@@ -168,13 +161,17 @@ def copy_file(src, dst, source, destination, item, job, stop, progress):
     )
     if not dst.sftp and os.path.isfile(temp) and has_reservation(destination, temp):
         os.unlink(destination)
+
+    def approved(existing):
+        if not decide(item["rel"], before, existing):
+            return False
+        if not stat.S_ISREG(existing.st_mode):
+            raise ValueError("Only regular files can be overwritten.")
+        return True
+
     existing = dst.existing(destination)
-    if existing and job["policy"] == "skip":
+    if existing and not approved(existing):
         return "skipped"
-    if existing and not stat.S_ISREG(existing.st_mode):
-        raise ValueError(
-            "A directory, link, or special file already has the destination name."
-        )
     # The random batch ID plus persistent row ID identifies our interrupted staging file.
     if dst.existing(temp):
         dst.remove(temp)
@@ -237,31 +234,60 @@ def copy_file(src, dst, source, destination, item, job, stop, progress):
             )
         if dst.stat(temp).st_size != size:
             raise IOError("Destination size check failed.")
-        mode = (
-            stat.S_IMODE(existing.st_mode) & 0o777
-            if existing
-            else (stat.S_IMODE(before.st_mode) & 0o755)
-        )
-        if dst.sftp:
-            dst.sftp.chmod(temp, mode)
-            dst.sftp.utime(temp, (int(before.st_mtime), int(before.st_mtime)))
-        else:
-            for operation, args in (
-                (os.chmod, (temp, mode)),
-                (os.utime, (temp, (before.st_mtime, before.st_mtime))),
-            ):
-                try:
-                    operation(*args)
-                except OSError as error:
-                    if error.errno not in (errno.EOPNOTSUPP, errno.EPERM, errno.EACCES):
-                        raise
+        check(stop)
+        # A file may appear or change while the staged copy is in progress.
+        target = dst.existing(destination)
+
+        def identity(info):
+            return (info.st_mode, info.st_size, info.st_mtime) if info else None
+
+        if target and identity(target) != identity(existing) and not approved(target):
+            return "skipped"
+
+        def apply_metadata(target):
+            mode = (
+                stat.S_IMODE(target.st_mode) & 0o777
+                if target
+                else stat.S_IMODE(before.st_mode) & 0o755
+            )
+            times = (
+                (int(before.st_mtime), int(before.st_mtime))
+                if dst.sftp
+                else (before.st_mtime, before.st_mtime)
+            )
+            if dst.sftp:
+                dst.sftp.chmod(temp, mode)
+                dst.sftp.utime(temp, times)
+            else:
+                for operation, args in (
+                    (os.chmod, (temp, mode)),
+                    (os.utime, (temp, times)),
+                ):
+                    try:
+                        operation(*args)
+                    except OSError as error:
+                        if error.errno not in (
+                            errno.EOPNOTSUPP,
+                            errno.EPERM,
+                            errno.EACCES,
+                        ):
+                            raise
+
+        apply_metadata(target)
         check(stop)
         try:
-            dst.commit(temp, destination, job["policy"] == "replace")
+            dst.commit(temp, destination, bool(target))
         except OSError:
-            if job["policy"] == "skip" and dst.existing(destination):
+            if target:
+                raise
+            target = dst.existing(destination)
+            if not target:
+                raise
+            if not approved(target):
                 return "skipped"
-            raise
+            apply_metadata(target)
+            check(stop)
+            dst.commit(temp, destination, True)
         committed = True
         return "done"
     finally:
@@ -271,11 +297,13 @@ def copy_file(src, dst, source, destination, item, job, stop, progress):
 
 
 class Batch:
-    def __init__(self, store, session, job, limit):
+    def __init__(self, store, session, job, limit, conflicts=None):
         self.store, self.session, self.job, self.limit = store, session, job, limit
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.active = {}
+        self.recent = OrderedDict()
+        self.conflicts = conflicts
         self.transferred = 0
         self.finished_at = None
         self.outcome = None
@@ -288,6 +316,15 @@ class Batch:
     def snapshot(self):
         with self.lock:
             return dict(self.active), self.transferred
+
+    def activity(self):
+        with self.lock:
+            return self.recent.copy()
+
+    def decide(self, path, source, target):
+        if self.conflicts:
+            return self.conflicts.resolve(self, path, source, target)
+        return should_replace(self.job["policy"], source, target)
 
     def channel(self):
         channel = getattr(self.local, "sftp", None)
@@ -316,38 +353,72 @@ class Batch:
         if item["kind"] == "folder":
             if not stat.S_ISDIR(source.stat(srcpath).st_mode):
                 raise ValueError("The selected folder changed type.")
+            target = dest.existing(dstpath)
+            if target and not stat.S_ISDIR(target.st_mode):
+                if not self.decide(rel, source.stat(srcpath), target):
+                    return "skipped"
+                raise ValueError("A folder cannot replace a file or symbolic link.")
             dest.folder(dstpath)
             rows = []
             for name, typ, size, _ in source.list(srcpath):
                 check(self.stop)
                 rows.append((posixpath.join(rel, name), typ, size))
                 if len(rows) == 128:
-                    with self.store.write():
-                        self.store.children(self.job["id"], rows)
+                    if not self.store.discovered(self.job["id"], rel, rows):
+                        return "removed"
                     rows.clear()
-            with self.store.write():
-                self.store.children(self.job["id"], rows)
+            if not self.store.discovered(self.job["id"], rel, rows):
+                return "removed"
             return "done"
         previous = 0
 
         def progress(offset, size):
             nonlocal previous
+            if size != item["size"]:
+                with self.store.write() as db:
+                    db.execute(
+                        "UPDATE entries SET size=? WHERE id=?", (size, item["id"])
+                    )
+                item["size"] = size
             with self.lock:
+                self.recent[item["id"]] = (rel, offset, size, "working")
                 self.active[item["id"]] = (rel, offset, size)
                 self.transferred += offset - previous
             previous = offset
 
         return copy_file(
-            source, dest, srcpath, dstpath, item, self.job, self.stop, progress
+            source,
+            dest,
+            srcpath,
+            dstpath,
+            item,
+            self.job,
+            self.stop,
+            progress,
+            self.decide,
         )
 
     def work(self, item):
+        state = "stopped"
+        if item["kind"] == "file":
+            with self.lock:
+                self.recent.pop(item["id"], None)
+                if len(self.recent) >= 256:
+                    oldest = next(
+                        (k for k, row in self.recent.items() if row[3] != "working"),
+                        None,
+                    )
+                    if oldest is not None:
+                        del self.recent[oldest]
+                self.recent[item["id"]] = (item["rel"], 0, item["size"], "working")
         try:
             state = self.execute(item)
             self.store.finish(item["id"], state)
         except Paused:
+            state = "paused"
             self.store.finish(item["id"], "ready")
         except Exception as error:
+            state = "failed"
             channel = getattr(self.local, "sftp", None)
             if channel:
                 with contextlib.suppress(Exception):
@@ -377,8 +448,10 @@ class Batch:
                 error, (paramiko.BadHostKeyException, paramiko.AuthenticationException)
             )
             if self.stop.is_set():
+                state = "paused"
                 self.store.finish(item["id"], "ready")
             elif retry and item["tries"] < 2:
+                state = "retry"
                 self.stop.wait(2 * (item["tries"] + 1))
                 self.store.finish(item["id"], "ready", describe(error), 1)
             elif network:
@@ -389,6 +462,9 @@ class Batch:
         finally:
             with self.lock:
                 self.active.pop(item["id"], None)
+                if item["id"] in self.recent:
+                    name, offset, size, _ = self.recent[item["id"]]
+                    self.recent[item["id"]] = (name, offset, size, state)
 
     def run(self):
         job = self.job["id"]
