@@ -1,6 +1,7 @@
 """Real SFTP regressions for streaming discovery and restrictive server limits."""
 
 import hashlib
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -8,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from integration import Batch, Server, Session, Store, load_key, wait
+from sftp_requests import StatRequests
 from transfer import Endpoint
 
 
@@ -75,6 +77,66 @@ class StreamingTest(unittest.TestCase):
                     self.assertEqual(
                         file.read_bytes(), (dest / "tree" / file.name).read_bytes()
                     )
+
+    def test_deep_path_and_linked_ancestor(self):
+        root, _, session = self.server(1)
+        rel = "/".join(["nested"] * (StatRequests.limit + 2))
+        base = root / "source"
+        (base / rel).mkdir(parents=True)
+        (base / rel / "payload").write_bytes(b"deep")
+        (base / "link").symlink_to(base / rel)
+        with session.channel() as channel:
+            for source in (Endpoint(channel), Endpoint()):
+                self.assertEqual(
+                    source.inspect_path(str(base), rel + "/payload").st_size, 4
+                )
+                self.assertIsNone(source.inspect_path(str(base), rel + "/missing"))
+                with self.assertRaisesRegex(ValueError, "became a link"):
+                    source.inspect_path(str(base), "link/payload")
+
+    def test_metadata_replies_match_request_ids(self):
+        root, _, session = self.server(1)
+        first, other = root / "first", root / "other"
+        first.write_bytes(b"a")
+        other.write_bytes(b"abc")
+        with session.channel() as channel:
+            queries = StatRequests(
+                channel, [str(first), str(root / "missing"), str(other)]
+            )
+            receive = queries._async_response
+            buffered = []
+
+            def reorder(*reply):
+                buffered.append(reply)
+                if len(buffered) == 3:
+                    for response in reversed(buffered):
+                        receive(*response)
+
+            with patch.object(queries, "_async_response", reorder):
+                a, missing, b = queries.results()
+            self.assertEqual((a.st_size, missing, b.st_size), (1, None, 3))
+            # The channel can service an unrelated request after the whole batch.
+            self.assertEqual(channel.lstat(str(other)).st_size, 3)
+
+    def test_source_changes_after_last_read(self):
+        root, store, session = self.server(2)
+        src, dest = root / "source", root / "dest"
+        (src / "tree").mkdir(parents=True)
+        dest.mkdir()
+        payload = src / "tree" / "payload"
+        payload.write_bytes(b"original")
+        fsync = os.fsync
+
+        def change_source(fd):
+            fsync(fd)
+            payload.write_bytes(b"changed size")
+
+        with patch("transfer.os.fsync", side_effect=change_source):
+            batch = self.start(store, session, "Download", src, dest, 1)
+            batch.thread.join(20)
+        self.assertEqual(batch.outcome, "Needs attention")
+        self.assertIn("Source changed", str(store.errors(batch.job["id"])))
+        self.assertEqual(list((dest / "tree").iterdir()), [])
 
     def test_server_with_one_sftp_channel_drains_both_queues(self):
         root, store, session = self.server(1)

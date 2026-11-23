@@ -126,6 +126,7 @@ class Window(QMainWindow):
         self.closing = False
         self.queue_widgets = {}
         self.queue_key = None
+        self.monitor_job = None
         self.series = Throughput()
         self.setWindowTitle("PORT22")
         self.setWindowIcon(icon("mark", LILAC, 64))
@@ -833,6 +834,7 @@ class Window(QMainWindow):
             self.draw_queue()
 
     def render_monitor(self, batch, outcome):
+        self.monitor_job = batch.job["id"]
         self.queue_monitor.display(
             batch.job["direction"], outcome, self.settings.get("motion", True)
         )
@@ -843,10 +845,18 @@ class Window(QMainWindow):
         else:
             self.work_monitor.hide()
 
-    def clear_history(self):
+    def clear_history(self, job_id=None):
         with self.store.write() as db:
-            db.execute("DELETE FROM jobs WHERE status='Complete'")
-        if not self.store.jobs():
+            if job_id is None:
+                db.execute("DELETE FROM jobs WHERE status='Complete'")
+            else:
+                db.execute(
+                    "DELETE FROM jobs WHERE id=? AND status='Complete'", (job_id,)
+                )
+        if self.monitor_job and not any(
+            job["id"] == self.monitor_job for job in self.store.jobs()
+        ):
+            self.monitor_job = None
             self.queue_monitor.hide()
             self.lanes.hide()
         self.draw_queue()
@@ -950,7 +960,15 @@ class Window(QMainWindow):
                     label(j["status"], "mint" if j["status"] == "Complete" else "micro")
                 )
                 row.addWidget(button("Details", lambda j=j: self.details(j)))
-                if j["status"] != "Complete":
+                if j["status"] == "Complete":
+                    dismiss = button("×", lambda j=j: self.clear_history(j["id"]))
+                    dismiss.setAccessibleName(
+                        f"Remove {j['title']} from transfer history"
+                    )
+                    dismiss.setToolTip("Remove from transfer history")
+                    dismiss.setFixedWidth(32)
+                    row.addWidget(dismiss)
+                else:
                     row.addWidget(
                         button(
                             "Queue",

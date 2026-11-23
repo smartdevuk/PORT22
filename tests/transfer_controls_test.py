@@ -10,9 +10,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QPushButton
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "port22"))
+from app import Window
 from conflicts import ConflictRules, Paused, should_replace
 from dialogs import QueueDialog
 from store import Store
@@ -120,6 +121,8 @@ class ControlsTest(unittest.TestCase):
                 threading.Event(),
                 lambda *_: None,
                 ask,
+                src.stat(),
+                None,
             )
         self.assertEqual(
             (state, dest.read_bytes(), calls), ("skipped", b"appeared", [True])
@@ -153,6 +156,37 @@ class ControlsTest(unittest.TestCase):
         # A working directory returned on pause must not re-enter the queue.
         self.store.finish(folder["id"], "ready")
         self.assertIsNone(self.store.take(key))
+
+    def test_dismiss_one_completed_transfer(self):
+        completed = []
+        for name in ("archive", "website"):
+            (self.root / name).write_text(name)
+            job = self.store.add(
+                "demo", "Download", "/src", str(self.root), [(name, "file", 7)], "skip"
+            )
+            self.store.status(job, "Complete")
+            completed.append(job)
+        paused = self.job([("later", "file", 1)])["id"]
+        self.store.status(paused, "Paused")
+        window = Window(self.store)
+        self.addCleanup(window.close)
+        window.show_page(2)
+        window.monitor_job = completed[1]
+        window.queue_monitor.show()
+        window.lanes.show()
+        card = window.queue_widgets[completed[0]].parentWidget()
+        dismiss = next(b for b in card.findChildren(QPushButton) if b.text() == "×")
+        self.assertIn("archive", dismiss.accessibleName())
+        dismiss.click()
+        self.assertEqual({j["id"] for j in self.store.jobs()}, {paused, completed[1]})
+        self.assertFalse(window.queue_monitor.isHidden())
+        window.clear_history(paused)
+        window.clear_done.click()
+        self.assertEqual([j["id"] for j in self.store.jobs()], [paused])
+        self.assertTrue(window.queue_monitor.isHidden())
+        self.assertTrue(window.lanes.isHidden())
+        for name in ("archive", "website"):
+            self.assertEqual((self.root / name).read_text(), name)
 
     def test_queue_editor_and_history_scroll(self):
         job = self.job([(f"part{i}", "file", i) for i in range(180)])

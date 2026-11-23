@@ -2,7 +2,7 @@
 
 A native SFTP client for Chromebook and Linux. Save your servers and SSH keys, browse local and remote folders side by side, and watch parallel transfers on a live throughput graph.
 
-**[Download PORT22 for Debian / Chromebook](https://github.com/smartdevuk/PORT22/raw/refs/heads/main/packages/port22_1.2.1_all.deb)** · [Installation](#install-on-a-chromebook) · [Full-resolution transfer video](https://github.com/smartdevuk/PORT22/raw/refs/heads/main/docs/media/transfer.mp4)
+**[Download PORT22 for Debian / Chromebook](https://github.com/smartdevuk/PORT22/raw/refs/heads/main/packages/port22_1.2.2_all.deb)** · [Installation](#install-on-a-chromebook) · [Full-resolution transfer video](https://github.com/smartdevuk/PORT22/raw/refs/heads/main/docs/media/transfer.mp4)
 
 ![PORT22 transferring a release folder over SFTP. The live throughput trace and four file progress bars update during the download.](docs/media/transfer.gif)
 
@@ -16,12 +16,12 @@ The nine-second recording shows an actual SFTP download from a local OpenSSH ser
 
    ```sh
    sudo apt update
-   sudo apt install ~/port22_1.2.1_all.deb
+   sudo apt install ~/port22_1.2.2_all.deb
    ```
 
 4. Search the Launcher for **PORT22**. Right-click the icon and choose **Pin to shelf**. Opening it takes you straight to your saved connections.
 
-The same package targets Debian 12 and 13 on desktop Linux. If you downloaded it to your usual Downloads folder, run `sudo apt install ~/Downloads/port22_1.2.1_all.deb`. The package is architecture-independent and uses Debian's native Qt, Python and SSH libraries.
+The same package targets Debian 12 and 13 on desktop Linux. If you downloaded it to your usual Downloads folder, run `sudo apt install ~/Downloads/port22_1.2.2_all.deb`. The package is architecture-independent and uses Debian's native Qt, Python and SSH libraries.
 
 **Upgrading from Violet Relay 1.0:** close the old app, then install PORT22. APT replaces the earlier package. PORT22 reopens its saved connections, known host keys, preferences and queue. Pin the new PORT22 launcher.
 
@@ -42,10 +42,10 @@ Set an optional remote start folder such as `/var/www`. The local pane remembers
 - **Select and copy.** Choose files or folders on either side, then click **Upload** or **Download**. Right-click a selection for the same actions, or drag it to the opposite pane to queue it immediately. Ctrl-click and Shift-click select multiple entries.
 - **Tune parallelism.** Four files transfer at once by default. **Preferences → Simultaneous files** accepts one to eight. The next batch uses the new limit. Pause and resume an active batch to apply it.
 - **Read the monitor.** The large number is aggregate payload throughput. The trace shows the last 12 seconds and the peak sampled rate. Route markers follow the direction of travel and advance with transferred bytes. **Transfers** shows four fixed rows of file activity. New files appear at the bottom. Scroll back through the 256 most recent starts, or scroll to the bottom to follow live again. After a batch stops, the monitor shows its average for that run. Retransmitted bytes count towards throughput. Turn off animation in **Preferences** to keep the readings with reduced motion.
-- **Copy directory trees.** PORT22 starts copying files as they are discovered and scans up to five folders concurrently. The simultaneous-files preference still controls the number of file copies. The batch uses at most nine SFTP channels and backs off when a server accepts fewer. Hidden files and empty folders are included. Symbolic links and special files are skipped. Existing directories merge, and extra destination files stay in place.
+- **Copy directory trees.** PORT22 starts copying files as they are discovered and scans up to five folders concurrently. PORT22 checks each remote path in a bounded batch of SFTP requests to reduce the wait between small files. The simultaneous-files preference still controls the number of file copies. The batch uses at most nine SFTP channels and backs off when a server accepts fewer. Hidden files and empty folders are included. Symbolic links and special files are skipped. Existing directories merge, and extra destination files stay in place.
 - **Handle a conflict.** The first time a destination name is already in use, compare sizes and modification times. The default is **Skip → This connection session**. You can also overwrite always, when sizes differ, when the source is newer, or when size or modification time differs. Apply the choice to one file, the current transfer, or all transfers until you disconnect. Closing the prompt pauses the batch. A transfer-specific choice survives pause and restart.
 - **Track overall progress.** The workspace status strip shows completed files and transferred bytes against the current batch totals, including partial bytes of active files. Totals grow while folders are scanned. Skipped and removed files drop out of the totals.
-- **Edit the queue.** Choose **Queue** beside **Details** on an unfinished batch to search and remove waiting items. Removing a folder also excludes its undiscovered contents. Files already transferring finish normally.
+- **Edit the queue.** Choose **Queue** beside **Details** on an unfinished batch to search and remove waiting items. Removing a folder also excludes its undiscovered contents. Files already transferring finish normally. Click **×** beside a completed transfer to remove its history entry, or **Clear completed** to clear all finished entries. Your files stay in place.
 - **Change permissions.** Right-click files or folders in either pane, choose **Permissions…**, and enter an octal mode such as `644` or `755`. The preview shows the resulting read, write and execute bits. Changes apply to the selection only.
 - **Recover a queue.** Transient connection failures are retried. After a restart, reconnect to the same server and use **Transfers → Resume**. Completed files stay completed. An incomplete file restarts from its beginning. **Details** lists failed paths.
 
@@ -65,7 +65,7 @@ PORT22 publishes a replacement after writing a temporary file and checking its l
 ```sh
 sudo apt install python3-pyqt5 python3-paramiko python3-cryptography putty-tools dpkg-dev
 ./build.sh
-sudo apt install ./dist/port22_1.2.1_all.deb
+sudo apt install ./dist/port22_1.2.2_all.deb
 ```
 
 For development, run `/usr/bin/python3 port22/app.py` from the checkout. The tests below use throwaway keys, temporary directories and a loopback OpenSSH server. The transfer and GUI tests require `openssh-server`, `openssh-client`, and a local account allowed to authenticate by public key.

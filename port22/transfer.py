@@ -15,6 +15,7 @@ import time
 import paramiko
 from connection import describe
 from conflicts import Paused, check, should_replace
+from sftp_requests import StatRequests
 
 
 def safe_name(name):
@@ -117,15 +118,27 @@ class Endpoint:
                         info.st_mtime,
                     )
 
-    def parents(self, root, rel):
-        # Never traverse a link discovered inside a selected tree, on either side.
-        path = root
-        if not stat.S_ISDIR(self.stat(root).st_mode):
-            raise ValueError(f"Base folder is no longer a directory: {root}")
-        for name in rel.split("/")[:-1]:
-            path = posixpath.join(path, safe_name(name))
-            if not stat.S_ISDIR(self.stat(path).st_mode):
-                raise ValueError(f"Directory changed or became a link: {path}")
+    def stat_paths(self, paths):
+        if not self.sftp:
+            yield from map(self.existing, paths)
+            return
+        for start in range(0, len(paths), StatRequests.limit):
+            group = paths[start : start + StatRequests.limit]
+            yield from StatRequests(self.sftp, group).results()
+
+    def inspect_path(self, root, rel):
+        paths = [root]
+        for name in rel.split("/"):
+            paths.append(posixpath.join(paths[-1], safe_name(name)))
+        # Verify every ancestor before the caller opens, lists or modifies a file.
+        attrs = self.stat_paths(paths)
+        for path in paths[:-1]:
+            info = next(attrs)
+            if info is None or not stat.S_ISDIR(info.st_mode):
+                raise ValueError(
+                    f"Directory is missing, changed type or became a link: {path}"
+                )
+        return next(attrs)
 
     def open(self, path, mode):
         return self.sftp.open(path, mode) if self.sftp else open(path, mode)
@@ -142,8 +155,9 @@ class Endpoint:
             install_exclusive(temp, dest)
 
 
-def copy_file(src, dst, source, destination, item, job, stop, progress, decide):
-    before = src.stat(source)
+def copy_file(
+    src, dst, source, destination, item, job, stop, progress, decide, before, existing
+):
     if not stat.S_ISREG(before.st_mode):
         raise ValueError("Source changed type while queued.")
     temp = posixpath.join(
@@ -151,6 +165,7 @@ def copy_file(src, dst, source, destination, item, job, stop, progress, decide):
     )
     if not dst.sftp and os.path.isfile(temp) and has_reservation(destination, temp):
         os.unlink(destination)
+        existing = None
 
     def approved(existing):
         if not decide(item["rel"], before, existing):
@@ -159,7 +174,6 @@ def copy_file(src, dst, source, destination, item, job, stop, progress, decide):
             raise ValueError("Only regular files can be overwritten.")
         return True
 
-    existing = dst.existing(destination)
     if existing and not approved(existing):
         return "skipped"
     # The random batch ID plus persistent row ID identifies our interrupted staging file.
@@ -217,16 +231,23 @@ def copy_file(src, dst, source, destination, item, job, stop, progress, decide):
                 except OSError as error:
                     if error.errno not in (errno.EINVAL, errno.EOPNOTSUPP):
                         raise
-        after = src.stat(source)
-        if (after.st_size, after.st_mtime) != (size, before.st_mtime):
+            # All bytes have been read. Overlap the final source check with closing
+            # its remote handle, then verify the reply before publishing anything.
+            final_stat = StatRequests(src.sftp, [source]) if src.sftp else None
+        after = next(final_stat.results()) if final_stat else src.stat(source)
+        if (
+            after is None
+            or not stat.S_ISREG(after.st_mode)
+            or (after.st_size, after.st_mtime) != (size, before.st_mtime)
+        ):
             raise IOError(
                 "Source changed during the transfer. Retry when it has finished changing."
             )
-        if dst.stat(temp).st_size != size:
+        # A file may appear or change while the staged copy is in progress.
+        staged, target = dst.stat_paths([temp, destination])
+        if staged is None or not stat.S_ISREG(staged.st_mode) or staged.st_size != size:
             raise IOError("Destination size check failed.")
         check(stop)
-        # A file may appear or change while the staged copy is in progress.
-        target = dst.existing(destination)
 
         def identity(info):
             return (info.st_mode, info.st_size, info.st_mtime) if info else None
@@ -404,17 +425,15 @@ class Batch:
         if self.job["direction"] == "Download":
             source, dest = dest, source
         rel = item["rel"]
-        for name in rel.split("/"):
-            safe_name(name)
-        source.parents(self.job["src"], rel)
-        dest.parents(self.job["dst"], rel)
         srcpath = posixpath.join(self.job["src"], rel)
         dstpath = posixpath.join(self.job["dst"], rel)
+        info = source.inspect_path(self.job["src"], rel)
+        if info is None:
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), srcpath)
+        target = dest.inspect_path(self.job["dst"], rel)
         if item["kind"] == "folder":
-            info = source.stat(srcpath)
             if not stat.S_ISDIR(info.st_mode):
                 raise ValueError("The selected folder changed type.")
-            target = dest.existing(dstpath)
             if target is None:
                 (dest.sftp.mkdir if dest.sftp else os.mkdir)(dstpath)
             elif not stat.S_ISDIR(target.st_mode):
@@ -448,6 +467,8 @@ class Batch:
             self.stop,
             progress,
             self.decide,
+            info,
+            target,
         )
 
     def work(self, item):
