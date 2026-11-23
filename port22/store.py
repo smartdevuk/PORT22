@@ -33,6 +33,8 @@ class Store:
           kind TEXT NOT NULL, size INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'ready',
           tries INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', UNIQUE(job,rel));
         CREATE INDEX IF NOT EXISTS schedule ON entries(job,state,id);
+        CREATE INDEX IF NOT EXISTS ready_folders ON entries(job,id) WHERE state='ready' AND kind='folder';
+        CREATE INDEX IF NOT EXISTS ready_files ON entries(job,id) WHERE state='ready' AND kind!='folder';
         CREATE TABLE IF NOT EXISTS excluded_folders (
           job TEXT NOT NULL REFERENCES jobs ON DELETE CASCADE, rel TEXT NOT NULL, PRIMARY KEY(job,rel));
         CREATE INDEX IF NOT EXISTS batch_totals ON entries(job,state,kind,size);
@@ -206,12 +208,17 @@ class Store:
             ),
         )
 
-    def take(self, job):
+    def take(self, job, *, folders=None):
+        if folders is True:
+            # Prefer a new branch, even if thousands of sibling folders are waiting.
+            selection = "INDEXED BY ready_folders WHERE job=? AND state='ready' AND kind='folder' ORDER BY id DESC"
+        elif folders is False:
+            selection = "INDEXED BY ready_files WHERE job=? AND state='ready' AND kind!='folder' ORDER BY id"
+        else:
+            selection = "WHERE job=? AND state='ready' ORDER BY id"
+        query = "SELECT * FROM entries " + selection + " LIMIT 1"
         with self.write() as db:
-            row = db.execute(
-                "SELECT * FROM entries WHERE job=? AND state='ready' ORDER BY id LIMIT 1",
-                (job,),
-            ).fetchone()
+            row = db.execute(query, (job,)).fetchone()
             if row:
                 db.execute(
                     "UPDATE entries SET state='working' WHERE id=?", (row["id"],)

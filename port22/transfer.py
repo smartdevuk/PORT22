@@ -1,4 +1,4 @@
-"""A bounded worker pool and an interruptible, disk-backed directory walk."""
+"""Stream a disk-backed directory walk into a bounded pool of SFTP copies."""
 
 from collections import OrderedDict
 import concurrent.futures as futures
@@ -93,16 +93,6 @@ class Endpoint:
             return self.stat(path)
         except FileNotFoundError:
             return None
-
-    def folder(self, path):
-        attr = self.existing(path)
-        if attr is None:
-            if self.sftp:
-                self.sftp.mkdir(path)
-            else:
-                os.mkdir(path)
-        elif not stat.S_ISDIR(attr.st_mode):
-            raise ValueError(f"Destination is not a regular directory: {path}")
 
     def list(self, path):
         if self.sftp:
@@ -296,11 +286,21 @@ def copy_file(src, dst, source, destination, item, job, stop, progress, decide):
                 dst.remove(temp)
 
 
+class NoSpareChannel(Exception):
+    """The server declined an extra worker. Its item goes back to the shared queue."""
+
+
 class Batch:
+    scan_limit = 5
+
     def __init__(self, store, session, job, limit, conflicts=None):
         self.store, self.session, self.job, self.limit = store, session, job, limit
         self.stop = threading.Event()
         self.lock = threading.Lock()
+        # Cap channels per batch so browsing has headroom on the usual 10-session server.
+        self.worker_count = min(9, self.limit + self.scan_limit)
+        self.schedule = threading.Condition()
+        self.scanning = self.copying = 0
         self.active = {}
         self.recent = OrderedDict()
         self.conflicts = conflicts
@@ -308,7 +308,10 @@ class Batch:
         self.finished_at = None
         self.outcome = None
         self.local = threading.local()
-        self.channels = []
+        self.channel_lock = threading.Lock()
+        self.idle_channels = []
+        self.channel_count = 0
+        self.channel_limit = self.worker_count
         self.thread = threading.Thread(
             target=self.run, daemon=True, name="queue-controller"
         )
@@ -327,16 +330,75 @@ class Batch:
         return should_replace(self.job["policy"], source, target)
 
     def channel(self):
-        channel = getattr(self.local, "sftp", None)
-        if channel is None or channel.get_channel().closed:
-            channel = self.session.channel()
+        with self.channel_lock:
+            while self.idle_channels:
+                channel = self.idle_channels.pop()
+                if not channel.get_channel().closed:
+                    break
+                self.channel_count -= 1
+            else:
+                if self.channel_count >= self.channel_limit:
+                    raise NoSpareChannel()
+                try:
+                    channel = self.session.channel()
+                except paramiko.ChannelException:
+                    if self.channel_count:
+                        self.channel_limit = self.channel_count
+                        raise NoSpareChannel()
+                    raise
+                self.channel_count += 1
             self.local.sftp = channel
-            with self.lock:
-                self.channels.append(channel)
-        return channel
+            return channel
+
+    def release_channel(self, *, discard=False):
+        channel = getattr(self.local, "sftp", None)
+        if channel is None:
+            return
+        if discard:
+            with contextlib.suppress(Exception):
+                channel.close()
+        with self.channel_lock:
+            if discard or channel.get_channel().closed:
+                self.channel_count -= 1
+            else:
+                self.idle_channels.append(channel)
+        self.local.sftp = None
+
+    def discover(self, source, srcpath, rel):
+        rows = []
+        seen_folder = seen_file = False
+        last_flush = time.monotonic()
+
+        def flush():
+            accepted = self.store.discovered(self.job["id"], rel, rows)
+            if accepted and rows:
+                with self.schedule:
+                    self.schedule.notify_all()
+            rows.clear()
+            return accepted
+
+        for name, typ, size, _ in source.list(srcpath):
+            check(self.stop)
+            rows.append((posixpath.join(rel, name), typ, size))
+            first = (typ == "folder" and not seen_folder) or (
+                typ == "file" and not seen_file
+            )
+            seen_folder |= typ == "folder"
+            seen_file |= typ == "file"
+            now = time.monotonic()
+            if first or len(rows) >= 128 or now - last_flush >= 0.1:
+                if not flush():
+                    # An interrupted remote directory iterator can leave unread replies.
+                    if source.sftp:
+                        self.release_channel(discard=True)
+                    return "removed"
+                last_flush = now
+        return "done" if flush() else "removed"
 
     def execute(self, item):
         check(self.stop)
+        if item["kind"] in ("link", "special"):
+            return "skipped"
         sftp = self.channel()
         source, dest = Endpoint(), Endpoint(sftp)
         if self.job["direction"] == "Download":
@@ -348,28 +410,18 @@ class Batch:
         dest.parents(self.job["dst"], rel)
         srcpath = posixpath.join(self.job["src"], rel)
         dstpath = posixpath.join(self.job["dst"], rel)
-        if item["kind"] in ("link", "special"):
-            return "skipped"
         if item["kind"] == "folder":
-            if not stat.S_ISDIR(source.stat(srcpath).st_mode):
+            info = source.stat(srcpath)
+            if not stat.S_ISDIR(info.st_mode):
                 raise ValueError("The selected folder changed type.")
             target = dest.existing(dstpath)
-            if target and not stat.S_ISDIR(target.st_mode):
-                if not self.decide(rel, source.stat(srcpath), target):
+            if target is None:
+                (dest.sftp.mkdir if dest.sftp else os.mkdir)(dstpath)
+            elif not stat.S_ISDIR(target.st_mode):
+                if not self.decide(rel, info, target):
                     return "skipped"
                 raise ValueError("A folder cannot replace a file or symbolic link.")
-            dest.folder(dstpath)
-            rows = []
-            for name, typ, size, _ in source.list(srcpath):
-                check(self.stop)
-                rows.append((posixpath.join(rel, name), typ, size))
-                if len(rows) == 128:
-                    if not self.store.discovered(self.job["id"], rel, rows):
-                        return "removed"
-                    rows.clear()
-            if not self.store.discovered(self.job["id"], rel, rows):
-                return "removed"
-            return "done"
+            return self.discover(source, srcpath, rel)
         previous = 0
 
         def progress(offset, size):
@@ -417,16 +469,13 @@ class Batch:
         except Paused:
             state = "paused"
             self.store.finish(item["id"], "ready")
+        except NoSpareChannel:
+            state = "waiting"
+            self.store.finish(item["id"], "ready")
+            raise
         except Exception as error:
             state = "failed"
-            channel = getattr(self.local, "sftp", None)
-            if channel:
-                with contextlib.suppress(Exception):
-                    channel.close()
-                with self.lock:
-                    if channel in self.channels:
-                        self.channels.remove(channel)
-                self.local.sftp = None
+            self.release_channel(discard=True)
             network = (
                 isinstance(
                     error,
@@ -460,34 +509,61 @@ class Batch:
             else:
                 self.store.finish(item["id"], "failed", describe(error))
         finally:
+            self.release_channel()
             with self.lock:
                 self.active.pop(item["id"], None)
                 if item["id"] in self.recent:
                     name, offset, size, _ = self.recent[item["id"]]
                     self.recent[item["id"]] = (name, offset, size, state)
 
+    def worker(self):
+        job = self.job["id"]
+        while True:
+            with self.schedule:
+                while not self.stop.is_set():
+                    if self.copying < self.limit:
+                        item = self.store.take(job, folders=False)
+                        if item:
+                            self.copying += 1
+                            break
+                    scan_slots = min(self.scan_limit, max(1, self.worker_count - 1))
+                    if self.scanning < scan_slots:
+                        item = self.store.take(job, folders=True)
+                        if item:
+                            self.scanning += 1
+                            break
+                    if not (self.copying or self.scanning):
+                        return
+                    self.schedule.wait()
+                else:
+                    return
+            try:
+                self.work(item)
+            except NoSpareChannel:
+                # Keep a copy slot available when a server accepts fewer channels.
+                with self.schedule:
+                    self.worker_count -= 1
+                return
+            finally:
+                with self.schedule:
+                    if item["kind"] == "folder":
+                        self.scanning -= 1
+                    else:
+                        self.copying -= 1
+                    self.schedule.notify_all()
+
     def run(self):
         job = self.job["id"]
         self.store.status(job, "Running")
         problem = False
         try:
+            workers = self.worker_count
             with futures.ThreadPoolExecutor(
-                max_workers=self.limit, thread_name_prefix="sftp"
+                max_workers=workers, thread_name_prefix="sftp"
             ) as pool:
-                pending = set()
-                while True:
-                    while not self.stop.is_set() and len(pending) < self.limit:
-                        item = self.store.take(job)
-                        if not item:
-                            break
-                        pending.add(pool.submit(self.work, item))
-                    if not pending:
-                        break
-                    done, pending = futures.wait(
-                        pending, timeout=0.12, return_when=futures.FIRST_COMPLETED
-                    )
-                    for task in done:
-                        task.result()
+                tasks = [pool.submit(self.worker) for _ in range(workers)]
+                for task in futures.as_completed(tasks):
+                    task.result()
         except Exception as error:
             problem = True
             with self.store.write() as db:
@@ -496,7 +572,7 @@ class Batch:
                     (describe(error), job),
                 )
         finally:
-            for channel in self.channels:
+            for channel in self.idle_channels:
                 with contextlib.suppress(Exception):
                     channel.close()
             states = {r["state"] for r in self.store.states(job)}
@@ -513,3 +589,5 @@ class Batch:
 
     def pause(self):
         self.stop.set()
+        with self.schedule:
+            self.schedule.notify_all()

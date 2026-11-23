@@ -14,7 +14,7 @@ install -m 644 README.md "$stage/usr/share/doc/port22/"
 install -m 644 LICENSE "$stage/usr/share/doc/port22/copyright"
 cat > "$stage/DEBIAN/control" <<'META'
 Package: port22
-Version: 1.2.0
+Version: 1.2.1
 Architecture: all
 Section: net
 Priority: optional
@@ -27,4 +27,4 @@ Description: A native, dark violet SFTP client for ChromeOS Linux
  parallel, and recover queued transfers after interruptions.
 META
 chmod 755 "$stage" "$stage/DEBIAN"
-dpkg-deb --root-owner-group -Zxz --build "$stage" "$output_dir/port22_1.2.0_all.deb"
+dpkg-deb --root-owner-group -Zxz --build "$stage" "$output_dir/port22_1.2.1_all.deb"

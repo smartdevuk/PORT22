@@ -716,7 +716,11 @@ class Window(QMainWindow):
             f"{fmt(counts['transferred'])} / {fmt(counts['size'])}"
         )
         if counts["discovering"]:
-            text += "   ·   Scanning…"
+            text += (
+                "   ·   Scanning and transferring…"
+                if active
+                else "   ·   Scanning folders…"
+            )
         if counts["skipped"]:
             text += f"   ·   {counts['skipped']:,} skipped"
         if counts["failed"]:
