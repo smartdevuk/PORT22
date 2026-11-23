@@ -1,3 +1,5 @@
+<img src="assets/port22.png" alt="PORT22 app icon" width="80" height="80">
+
 # PORT22
 
 A native SFTP client for Chromebook and Linux. Save your servers and SSH keys, browse local and remote folders side by side, and watch parallel transfers on a live throughput graph.
