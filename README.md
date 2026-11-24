@@ -21,7 +21,8 @@ The nine-second recording shows an actual SFTP download from a local OpenSSH ser
    sudo apt install ~/port22_1.2.2_all.deb
    ```
 
-4. Search the Launcher for **PORT22**. Right-click the icon and choose **Pin to shelf**. Opening it takes you straight to your saved connections.
+4. Press the **Launcher** key (Search), type **PORT22**, and click the app to open your saved connections.
+5. While PORT22 is open, right-click its icon on the shelf at the bottom of the screen (or tap it with two fingers) and choose **Pin** or **Pin to shelf**. You can now reopen PORT22 from that icon, even after closing the app.
 
 The same package targets Debian 12 and 13 on desktop Linux. If you downloaded it to your usual Downloads folder, run `sudo apt install ~/Downloads/port22_1.2.2_all.deb`. The package is architecture-independent and uses Debian's native Qt, Python and SSH libraries.
 
